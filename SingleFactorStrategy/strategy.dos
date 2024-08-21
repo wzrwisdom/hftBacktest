@@ -1,0 +1,237 @@
+try{loadPlugin("Backtest")}catch(ex){print ex}
+try{loadPlugin("MatchingEngineSimulator")}catch(ex){print ex}
+
+
+@state
+def macd(lastPrice,short_= 240, long_ = 520, m = 180) {
+	dif = ewmMean(lastPrice, span=short_,adjust=false) - ewmMean(lastPrice, span=long_,adjust=false)
+	dea = ewmMean(dif, span=m,adjust=false)
+	macd = (dif - dea) * 2
+	return round(macd,4),round(prev(macd),4)
+}
+
+@state
+def myCCI(close,t,orderType) {
+	high=tmmax(t, iif(orderType==0,close,NULL), 30s)
+	low=tmmin(t, iif(orderType==0,close,NULL), 30s)
+	tp = iif(orderType==0,(high + low + close) \ 3,NULL)
+	avg_=tmavg(t,iif(orderType==0,close,NULL), 30s)
+	tmmad=tmavg(t,abs(tp-avg_),30s)
+	cci=ffill((tp - avg_) \ (0.015 *tmmad))
+	return round(cci,4),round(prev(cci),4)
+}
+
+@state
+def tradeVol30s(qty,time,orderType){
+	return tmsum(time,iif(orderType==0,qty,NULL),30s)
+}
+
+def initialize(mutable contextDict){
+	//通过Backtest::setUniverse可以更换当日股票池，
+	//如Backtest::setUniverse(contextDict["engine"],["688088.XSHG","688157.XSHG","688208.XSHG"])
+	print("initialize")
+	//订阅快照行情的指标
+	d=dict(STRING,ANY)
+	d["macd"]=<macd(lastPrice,240,520,180)[0]>
+	d["prevMacd"]=<macd(lastPrice,240,520,180)[1]>
+	Backtest::subscribeIndicator(contextDict["engine"], "snapshot", d)
+
+	d=dict(STRING,ANY)
+	d["cci"]=<myCCI(price, timestamp, orderType)[0]>
+	d["prevcci"]=<myCCI(price, timestamp, orderType)[1]>
+	d["tradeVol30s"]=<tradeVol30s(qty, timestamp, orderType)>
+	Backtest::subscribeIndicator(contextDict["engine"], "trade", d)
+	// 费率
+	contextDict["sellFeeRatio"] = 0.0002
+	contextDict["buyFeeRatio"] = 0.0002
+	///记录每日统计量
+	contextDict['dailyReport' ]=   table(1000:0,[`SecurityID,`tradeDate,`buyVolume,`buyAmount,`closeVolume,`closeAmount,`closePrice],
+	[SYMBOL,DATE,DOUBLE,DOUBLE,DOUBLE,DOUBLE,DOUBLE])
+	//
+	contextDict["buyList"] =array(SYMBOL,0)
+	contextDict["buyVol"] =500
+	//日志
+	contextDict["log"]=table(10000:0,[`tradeDate,`time,`info],[DATE,TIMESTAMP,STRING])
+}
+
+
+def beforeTrading(mutable contextDict){
+	//每日盘前回调函数
+	//1、通过contextDict["tradeDate"]可以获取当日；
+	//2、通过Backtest::setUniverse可以更换当日股票池，
+	//如Backtest::setUniverse(contextDict["engine"],["688088.XSHG","688157.XSHG","688208.XSHG"])
+	print ("beforeTrading: "+contextDict["tradeDate"])
+	tb=contextDict["log"]
+	contextDict["log"]=tb.append!(table(contextDict["tradeDate"] as tradeDate,now() as time,"beforeTrading" as info))
+}  
+
+def onSnapshot(mutable contextDict, msg){
+	////msg可以为字典或表，最新时刻的tick数据
+	if(second(contextDict["tradeTime"])<09:40:00 or second(contextDict["tradeTime"])>14:57:00){
+		return 
+	}
+	// print(contextDict["tradeTime"])
+	buyList=contextDict["buyList"]
+	///记录买入卖出信号处理
+	for (istock in msg.keys()){
+		macd=msg[istock]["macd"]
+		prevMacd=msg[istock]["prevMacd"]
+		if(prevMacd<0 and macd>0){
+			pos=Backtest::getPosition(contextDict["engine"],istock).longPosition[0]
+			if((pos<0) and (not istock in buyList)){	
+				buyList=buyList.append!(istock)
+			}
+		}
+		else if(prevMacd>0 and macd<0){
+			pos=Backtest::getPosition(contextDict["engine"],istock).longPosition[0]
+			print(Backtest::getOpenOrders(contextDict["engine"],istock,,"close"))
+
+			openOrdInfo = Backtest::getOpenOrders(contextDict["engine"],istock,,"close")
+			if (openOprdInfo.size() > 1){
+				remainQty=sum(nullFill(openOrdInfo.openQty,0))
+			} else {
+				remainQty=0
+			}
+			
+			print("pos: "+pos+" remainQty: "+remainQty+" pos(now): "+(pos-remainQty))
+			
+			if(pos-remainQty>0){
+				//卖出
+				pos=pos-remainQty
+				price=round(msg[istock]["lastPrice"]-0.02,3)
+				print("sell price: "+price+" pos: "+pos)
+				Backtest::submitOrder(contextDict["engine"], (istock,contextDict["tradeTime"], 5, price, pos, 3),"close")
+			}
+		}
+	}
+	contextDict["buyList"]=buyList		
+}
+	
+def onTick(mutable contextDict, msg){
+	//
+	if(second(contextDict["tradeTime"])<09:40:00 or second(contextDict["tradeTime"])>14:57:00){
+		return 
+	}
+	// print(contextDict["tradeTime"])
+	trade=msg["trade"]
+	if(trade.keys().size()==0){
+		return 
+	}
+	buyList=contextDict["buyList"]
+	sellList=contextDict["sellList"]
+	//step 1;买入
+	for(istock in trade.keys()){
+		contextDict["trade"]=trade
+		if(istock in buyList){
+			cci=trade[istock]["cci"]
+			prevcci=trade[istock]["prevcci"]
+			tradeVol30s=trade[istock]["tradeVol30s"]
+			//
+			buyFlag=false
+			//指标从下向上突破+100线进入超买区间时，过去30s内的成交量大于10000股是买入
+			if(prevcci<100. and cci>=100. and tradeVol30s>10000){
+				buyFlag=true
+			}
+			//指标从下向上突破-100线，买入
+			if(prevcci<-100. and cci>=-100. ){
+				buyFlag=true
+			}
+			if(buyFlag==false){
+				continue
+			}
+			//有持仓
+			pos=Backtest::getPosition(contextDict["engine"],istock).longPosition[0]
+			if(pos>0){
+				continue
+			}
+			//有在途单
+			opens=Backtest::getOpenOrders(contextDict["engine"],istock,,"buy")
+			if(opens.size()>0){
+				continue
+			}
+			//
+			price=round(trade[istock]["price"],2)
+			Backtest::submitOrder(contextDict["engine"], (istock, trade[istock]["timestamp"], 5, price, contextDict["buyVol"], 1), "buy")
+			buyList=buyList[buyList!=istock]
+		}
+	}
+}
+
+
+def onOrder( mutable contextDict,orders){
+	/* orders为字典列表
+	me->2022.04.11T09:5orderId->474
+	symbol->688157.XSHG
+	entrustTi0:43.000
+	amount->1100
+	price->94.319999999999993
+	status->1,   
+		-1（订单拒绝）;0（部成）1（完全成交   ）2（已经撤单） 4（已报）
+	entrustDirection->2          1是买单成交， 2是卖单成交
+	filledAmount->1100            成交数量
+	tradeBalance->0       撤单金额
+	 */
+	
+	for ( iorder in orders){	
+		if( not iorder.status  in [1]){ 
+			//   
+			return 
+		}	
+	}
+}
+
+
+def onTrade(mutable contextDict,trades){
+	/*
+	 * trades为字典列表
+	orderId->376
+	symbol->688157.XSHG
+	tradePrice->93.959999999999993
+	filledAmount->200
+	tradeTime->2022.04.11T09:53:16.220
+	entrustDirection->2
+	tradeBalance->18792//成交金额
+	 */
+	///成交主推回调
+	///在这里处理对冲模块
+	//print trades
+	
+}
+
+
+def afterTrading(mutable contextDict){
+	/*
+	 * 每日盘后调用
+	 */
+	tradeDate=contextDict["tradeDate"]
+	print ("afterTrading: "+tradeDate)
+	tb=contextDict["log"]
+	contextDict["log"]=tb.append!(table(contextDict["tradeDate"] as tradeDate,now() as time,"afterTrading" as info))
+	//每日盘后回调函数,每日进行盘后指标统计
+	tradeOutputTable= select * from Backtest::getTradeDetails(contextDict["engine"]) where sendTime.date()=tradeDate
+	
+	lastprice= Backtest::getLastPrice(contextDict["engine"])
+
+	tb=select sum(tradeQty) as volume,sum(tradePrice*tradeQty) as amount  from tradeOutputTable  
+	where OrderStatus in [0,1]  group by symbol as SecurityID, direction as BSFlag  
+	tb=select tradeDate as tradeDate, sum(iif(BSFlag==1 ,volume, 0)) as buyVolume, 
+	sum(iif(BSFlag==1, amount, 0)) as buyAmount, 
+	sum(iif(BSFlag==3 ,volume, 0))as closeVolume,
+	sum(iif(BSFlag==3 ,amount, 0)) as closeAmount
+	from tb group by SecurityID
+	update tb set closePrice=lastprice[SecurityID]
+	dailyReport=contextDict['dailyReport' ] 
+	reorderColumns!(tb, colNames(dailyReport))
+	contextDict['dailyReport' ]=dailyReport.append!(tb)
+
+}
+
+def finalized (mutable contextDict){
+	//
+	
+	tb=contextDict["log"]
+	contextDict["log"]=tb.append!(table(contextDict["tradeDate"] as tradeDate,now() as time,"finalized" as info))
+	
+ 	print('finalized')
+ }
+

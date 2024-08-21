@@ -1,0 +1,162 @@
+module backtestUtils
+
+def destroyAllBacktestEngine(){
+	/*
+	 * 引擎管理函数
+	 */
+    allEngines= Backtest::getBacktestEngineList()
+    for (i in allEngines.keys()){
+        Backtest::dropBacktestEngine(allEngines[i])
+    }    
+}
+
+
+
+def getTradeReplay(table, codes, idate){
+	ds = replayDS(sqlObj=<select 
+			iif(endsWith(securityid, '.SH'), (substr(securityid, 0, 6) + '.XSHG'), (substr(securityid, 0, 6) + '.XSHE')) as symbol,
+			iif(endsWith(securityid, '.SH'),"XSHG", "XSHE")as symbolSource,
+			tradetime as timestamp, 1 as sourceType, 
+			iif(trade_price == 0, 1, 0) as orderType,
+			trade_price as price, long(trade_volume) as qty, long(buy_seq_num) as buyNo, long(sell_seq_num) as sellNo, 
+			iif(buy_seq_num > sell_seq_num, 1, 2) as direction,
+			int(1) as ChannelNo, long(seq_num) as seqNum
+			from table where securityid in codes and date(tradetime) == idate>, dateColumn='date', timeColumn=`tradetime)
+	return ds
+}
+
+
+def getOrderReplay(table, codes, idate){
+	ds = replayDS(sqlObj=<select 
+			iif(endsWith(securityid, '.SH'), (substr(securityid, 0, 6) + '.XSHG'),(substr(securityid, 0, 6) + '.XSHE')) as symbol,
+			iif(endsWith(securityid, '.SH'), "XSHG", "XSHE") as symbolSource,
+			tradetime as timestamp, 0 as sourceType, 
+			iif(order_type in ['A', '0'], 2, iif(order_type in ['D'], 10, iif(order_type in ['U'], 3, 1))) as orderType, 
+			price as price, long(volume) as qty, long(seq_num) as buyNo, long(seq_num) as sellNo, 
+			iif(side in ['B'], 1, 2) as direction,
+			int(1) as ChannelNo, long(biz_index) as seqNum 
+			from table where securityid in codes and date(tradetime) ==idate>, dateColumn=`date, timeColumn=`tradetime)
+	return ds
+}
+
+
+def getSnapshotReplay(table, codes, idate){
+	cols = [
+		sqlColAlias(<iif(endsWith(securityid, '.SH'), (substr(securityid, 0, 6) + '.XSHG'),(substr(securityid, 0, 6) + '.XSHE'))>, 'symbol'),
+		sqlColAlias(<iif(endsWith(securityid, '.SH'), "XSHG", "XSHE")>, 'symbolSource'),
+		sqlColAlias(<tradetime>, 'timestamp'), sqlColAlias(<last_price>, 'lastPrice'), sqlColAlias(<double(0.0)>, 'upLimitPrice'), sqlColAlias(<double(0.0)>, 'downLimitPrice'),
+		sqlColAlias(<long(0)>, 'totalBidQty'), sqlColAlias(<long(0)>, 'totalOfferQty'),
+		sqlColAlias(parseExpr('fixedLengthArrayVector(' + concat(each(strReplace{"bid%n", "%n"}, string(1..10)), ',') + ')'), 'bidPrice'),
+		sqlColAlias(parseExpr('long(fixedLengthArrayVector(' + concat(each(strReplace{"bid_size%n", "%n"}, string(1..10)), ',') + '))'), 'bidQty'),
+		sqlColAlias(parseExpr('fixedLengthArrayVector(' + concat(each(strReplace{"ask%n", "%n"}, string(1..10)), ',') + ')'), 'offerPrice'),
+		sqlColAlias(parseExpr('long(fixedLengthArrayVector(' + concat(each(strReplace{"ask_size%n", "%n"}, string(1..10)), ',') + '))'), 'offerQty'),
+		sqlColAlias(<fixedLengthArrayVector([last_price])>, 'signal'), sqlColAlias(<long()>, 'seqNum'), sqlColAlias(<double(0.0)>, 'prevClosePrice')
+	]
+	whereConditions = [expr(sqlCol("tradetime", date), ==, idate)]
+	whereConditions.append!(expr(sqlCol("securityid"), in, codes))
+	whereConditions.append!(expr(09:30:00, <=, sqlCol("tradetime", time), <=, 15:00:00))
+	sql_code = sql(select=cols, from=table, where=whereConditions)
+
+	ds = replayDS(sqlObj=sql_code, dateColumn=`date, timeColumn=`tradetime)
+	return ds
+}
+
+		
+
+
+def runBacktest_tick(userConfig,initialize, beforeTrading,onTick,onSnapshot,onOrder,onTrade,afterTrading,
+	finalized,strategyName,startDate,endDate,codes){
+	try{Backtest::dropBacktestEngine(strategyName)}catch(ex){print ex}
+	
+	engine = Backtest::createBacktestEngine(strategyName, userConfig,, initialize,beforeTrading,onTick,onSnapshot,
+		onOrder,onTrade,afterTrading,finalized)
+	
+	startTime=09:30:00.000
+	endTime=15:00:15.000
+	tradeDates=getMarketCalendar("SSE",startDate, endDate)
+
+	// load table
+	dbName='dfs://Level2_data'
+	td_tbName='TradeRaw'
+	ord_tbName='OrderRaw'
+	snap_tbName='SnapshotRaw'
+	
+	td_table = loadTable(dbName, td_tbName)
+	ord_table = loadTable(dbName, ord_tbName)
+	snap_table = loadTable(dbName, snap_tbName)
+
+	// iterate all available date
+	for (idate in tradeDates){
+		colName=`msgTime`msgType`msgBody`symbol`ChannelNo`seqNum
+		colType= [TIMESTAMP, SYMBOL, BLOB,STRING,INT,LONG]
+		messageTable=table(100000:0, colName, colType)
+
+		ord_ds = getOrderReplay(ord_table, codes, idate)
+		td_ds = getTradeReplay(td_table, codes, idate)
+		snap_ds = getSnapshotReplay(snap_table, codes, idate)
+		
+		inputDict = dict(['entrust', 'trade', 'snapshot'], [ord_ds, td_ds, snap_ds])
+		replay(inputDict, messageTable, 'timestamp', 'timestamp', , , 1, `ChannelNo`seqNum)
+
+		if (messageTable.size() < 1){
+			print("数据错误:交易日没有数据"+string(idate))
+			return 
+		}
+		Backtest::appendQuotationMsg(engine, messageTable)
+	}
+
+
+	messageTable = select top 1* from messageTable where msgTime==msgTime.max()
+	update messageTable set msgType="END"
+	update messageTable set msgTime=concatDateTime(msgTime.date(),16:00:00)
+	backtest::appendQuotationMsg(engine,messageTable)
+	print("回测结束")
+	return engine
+}
+
+def runBacktest_snaponly(userConfig,initialize, beforeTrading,onSnapshot,onOrder,onTrade,afterTrading,
+	finalized,strategyName,startDate,endDate,codes){
+	try{Backtest::dropBacktestEngine(strategyName)}catch(ex){print ex}
+	
+	engine = Backtest::createBacktestEngine(strategyName, userConfig,, initialize,beforeTrading,,onSnapshot,
+		onOrder,onTrade,afterTrading,finalized)
+	
+	startTime=09:30:00.000
+	endTime=15:00:15.000
+	tradeDates=getMarketCalendar("SSE",startDate, endDate)
+
+	// load table
+	dbName='dfs://Level2_data'
+	snap_table = loadTable(dbName, snap_tbName)
+
+	// iterate all available date
+	for (idate in tradeDates){
+		colName=["symbol","symbolSource","timestamp","lastPrice","upLimitPrice","downLimitPrice","totalBidQty","totalOfferQty","bidPrice","bidQty","offerPrice","offerQty","signal","prevClosePrice"]
+		colType= ["STRING","STRING","TIMESTAMP","DOUBLE","DOUBLE","DOUBLE","LONG","LONG","DOUBLE[]","LONG[]","DOUBLE[]","LONG[]","DOUBLE[]","DOUBLE"]
+		messageTable=table(10000000:0, colName, colType)
+
+		cols = [
+			sqlColAlias(<iif(endsWith(securityid, '.SH'), (substr(securityid, 0, 6) + '.XSHG'),(substr(securityid, 0, 6) + '.XSHE'))>, 'symbol'),
+			sqlColAlias(<iif(endsWith(securityid, '.SH'), "XSHG", "XSHE")>, 'symbolSource'),
+			sqlColAlias(<tradetime>, 'timestamp'), sqlColAlias(<last_price>, 'lastPrice'), sqlColAlias(<double(0.0)>, 'upLimitPrice'), sqlColAlias(<double(0.0)>, 'downLimitPrice'),
+			sqlColAlias(<long(0)>, 'totalBidQty'), sqlColAlias(<long(0)>, 'totalOfferQty'),
+			sqlColAlias(parseExpr('fixedLengthArrayVector(' + concat(each(strReplace{"bid%n", "%n"}, string(1..10)), ',') + ')'), 'bidPrice'),
+			sqlColAlias(parseExpr('fixedLengthArrayVector(' + concat(each(strReplace{"bid_size%n", "%n"}, string(1..10)), ',') + ')'), 'bidQty'),
+			sqlColAlias(parseExpr('fixedLengthArrayVector(' + concat(each(strReplace{"ask%n", "%n"}, string(1..10)), ',') + ')'), 'offerPrice'),
+			sqlColAlias(parseExpr('fixedLengthArrayVector(' + concat(each(strReplace{"ask_size%n", "%n"}, string(1..10)), ',') + ')'), 'offerQty'),
+			sqlColAlias(<fixedLengthArrayVector([last_price])>, 'signal'), sqlColAlias(<double(0.0)>, 'prevClosePrice')
+		]
+		whereConditions = [expr(sqlCol("tradetime", date), ==, idate)]
+		whereConditions.append!(expr(sqlCol("securityid"), in, codes))
+		whereConditions.append!(expr(09:30:00, <=, sqlCol("tradetime", time), <=, 15:00:00))
+		sql_code = sql(select=cols, from=snap_table, where=whereConditions)
+		messageTable.append!(sql_code.eval())
+
+		if (messageTable.size() < 1){
+			print("数据错误:交易日没有数据"+string(idate))
+			return 
+		}
+		Backtest::appendQuotationMsg(engine, messageTable)
+	}
+}
+
